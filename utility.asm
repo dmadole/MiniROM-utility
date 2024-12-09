@@ -1,4 +1,4 @@
-;  Copyright 2022, David S. Madole <david@madole.net>
+;  Copyright 2024, David S. Madole <david@madole.net>
 ;
 ;  This program is free software: you can redistribute it and/or modify
 ;  it under the terms of the GNU General Public License as published by
@@ -14,450 +14,725 @@
 ;  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-; ra   - input character routine
-; rb   - output character routine
-; rc   - message output routine
-;
-; re.0 - input timeout
-; re.1 - soft uart baud rate
+          ; I/O pin definitions for the bit-bang serial routines. These are by
+          ; default compatible with the 1802/Mini and Pico/Elf machines.
 
-#define VERSION          4.7.4
+#define NO_GROUP       0                ; hardware defined - do not change
 
-#define NO_GROUP         0       ; defined by hardware, do not change
-#define UART_DETECT              ;  Use 1854 if no EF serial cable present
+#define UART_DETECT                     ; use uart if no bit-bang cable
+#define INIT_CON                        ; initialize console before booting
 
-#ifdef 1802MINI
-  #define BRMK           bn2     ; These can be anything on the 1802/Mini but
-  #define BRSP           b2      ;  conventionally they are the same as on the
-  #define SESP           req     ;  Pico/Elf using EF2 for serial input and
-  #define SEMK           seq     ;  Q for serrial output, both inverted
-  #define SET_BAUD       19200   ; Use this on bit-bang instead of auto-baud
-  #define FREQ_KHZ       4000    ; Clock frequency for baud rate calculation
-  #define EXP_PORT       5       ;  Group expander port
-  #define UART_GROUP     0       ; Group select for 1854
-  #define UART_DATA      6       ;  Data port for 1854
-  #define UART_STATUS    7       ;  Status/command port for 1854
-#endif
-
-#ifdef SUPERELF
-  #define BRMK           bn2     ; These can be anything on the 1802/Mini but
-  #define BRSP           b2      ;  conventionally they are the same as on the
-  #define SESP           req     ;  Pico/Elf using EF2 for serial input and
-  #define SEMK           seq     ;  Q for serrial output, both inverted
-  #define SET_BAUD       9600    ; Use this on bit-bang instead of auto-baud
-  #define FREQ_KHZ       1790    ; Clock frequency for baud rate calculation
-  #define EXP_PORT       5      ;  Group expander port
-  #define UART_GROUP     0       ; Group select for 1854
-  #define UART_DATA      6       ;  Data port for 1854
-  #define UART_STATUS    7       ;  Status/command port for 1854
-#endif
-
-#ifdef RC1802
-  #define BRMK           bn3     ; These can be anything on the 1802/Mini but
-  #define BRSP           b3      ;  conventionally they are the same as on the
-  #define SESP           req     ;  Pico/Elf using EF2 for serial input and
-  #define SEMK           seq     ;  Q for serrial output, both inverted
-  #define SET_BAUD       9600    ; Use this on bit-bang instead of auto-baud
-  #define FREQ_KHZ       2000    ; Clock frequency for baud rate calculation
-  #define EXP_PORT       1       ;  Group expander port
-  #define UART_GROUP     1
-  #define UART_DATA      2       ;  Data port for 1854
-  #define UART_STATUS    3       ;  Status/command port for 1854
-#endif
+#define BRMK           bn2              ; branch on serial mark
+#define BRSP           b2               ; branch on serial space
+#define SEMK           seq              ; set serial mark
+#define SESP           req              ; set serial space
+#define EXP_PORT       5                ; group i/o expander port
+#define EXP_MEMORY                      ; enable expansion memory
+#define UART_GROUP     0                ; uart port group
+#define UART_DATA      6                ; uart data port
+#define UART_STATUS    7                ; uart status/command port
+#define RTC_GROUP      1                ; real time clock group
+#define RTC_PORT       3                ; real time clock port
+#define SET_BAUD       19200            ; bit-bang serial fixed baud rate
+#define FREQ_KHZ       4000             ; default processor clock frequency
 
 
-soh:        equ   1
-etx:        equ   3
-eot:        equ   4
-ack:        equ   6
-bs:         equ   8
-lf:         equ   10
-cr:         equ   13
-nak:        equ   21
-can:        equ   24
+          ; Unpublished kernel vector points
+
+d_ideread:  equ   0447h
+d_idewrite: equ   044ah
 
 
-            ; All the code gets copied from ROM to RAM and then run from 
-            ; there so that EEPROM programming does not cause issues, since
-            ; the EEPROM cannot be read while programming is happening.
-            ; The code is copied into what would be the kernel space from
-            ; 0100 upwards and puts the stack at 00ff downwards.
-
-            org   100h
-
-start:      ldi   0eb00h.1              ; get msb of address to copy from
-            phi   r7
-
-            ldi   start.1               ; get msb of address to copy to
-            phi   r8
-
-            ldi   start.0               ; lsb of both is the same
-            plo   r7
-            plo   r8
-
-            ldi   (end-start).1         ; get length of code to copy
-            phi   r9
-            ldi   (end-start).0
-            plo   r9
-
-            br    cpyloop               ; go copy from rom to ram
+#define scall r4
+#define sret r5
 
 
-            ; SEDIT exits by jumping to D013h so arrange a jump there that
-            ; will restart the menu from the copy already in RAM.
+          ; These are flags in R8.1 used for various purposes in XMODEM.
 
-            org   0113h
+#define X_FIRST  1                      ; first xmodem packet was received
+#define X_WRITE  2                      ; xmodem receive operation is write
+#define X_VERIFY 4                      ; xmodem receive operation is verify
+#define X_ERROR  8                      ; an eeprom verify error occurred
 
-            lbr   reenter               ; reentry point for sedit exit
 
+            org   0300h
 
-            ; Copy the code from ROM to RAM and then jump to it.
-
-cpyloop:    lda   r7                    ; copy bytes from rom to ram
-            str   r8
-            inc   r8
-            dec   r9
-            glo   r9
-            bnz   cpyloop
-            ghi   r9
-            bnz   cpyloop
-
-            ldi   jumpr3.1              ; get address to jump to
-            phi   r3
-            ldi   jumpr3.0
-            plo   r3
-
-            sep   r3                    ; change pc to r3 to jump
-
-jumpr3:     b4    reenter               ; if input pressed, enter menu
-
-            lbr   0f000h                ; else boot
-
-reenter:    ldi   00ffh.1               ; setup stack from 00ff in r2
+initial:    ldi   1fffh.1
             phi   r2
-            ldi   00ffh.0
+            ldi   1fffh.0
             plo   r2
 
-            sex   r2                    ; use r2 for sp
+            sex   r2
 
-            ldi   message.1             ; pointer to message out routine
-            phi   rc
-            ldi   message.0
-            plo   rc
+            ldi   setscrt.1
+            phi   r3
+            ldi   setscrt.0
+            plo   r3
 
-            ldi   msgeban.1             ; pointer to initial banner
-            phi   r7
-            ldi   msgeban.0
-            plo   r7
+            sep   r3
 
-            BRMK  bitbang               ; use bit-bang if cable connected
 
-         #ifdef UART_GROUP
-            sex   r3
+          ; Utility is completely self-contained so that it doesn't depend on
+          ; BIOS, this makes it more survivable in the event of a BIOS upgrade
+          ; problem or other issue. So there are some basic I/O routines that
+          ; re-implement as well as SCRT subroutine calling to support them.
+
+setscrt:    ldi   call.1                ; setup r4 for scall
+            phi   r4
+            ldi   call.0
+            plo   r4
+
+            ldi   ret.1                 ; setup r5 for sret
+            phi   r5
+            ldi   ret.0
+            plo   r5
+
+            ldi   read.1
+            phi   rf
+            ldi   read.0
+            plo   rf
+
+
+          ; Choose and initialize the serial port. If the UART detect option
+          ; is set then use the bitbang port if a cable is plugged into it.
+          ; Otherwise use the UART if one is present or use bitbang if not.
+
+          #ifdef UART_DETECT
+            BRMK  setbits               ; use bitbang if cable is present
+          #endif
+
+          #if UART_GROUP
+            sex   r3                    ; set proper expander group for uart
             out   EXP_PORT
             db    UART_GROUP
             sex   r2
-         #endif
+          #endif
 
-            inp   UART_DATA             ; clear uart registers and flags
+            inp   UART_DATA             ; clear status flags and buffer
             inp   UART_STATUS
 
-            inp   UART_STATUS           ; does it seem like 1854 present
+            inp   UART_STATUS           ; use bitbang if uart not present
             ani   2fh
-            bnz   bitbang
+            bnz   setbits
 
-            ldi   19h                   ; initialize uart data format
-            str   r2
+            sex   r3                    ; 8 data bits, 1 stop bit, no parity
             out   UART_STATUS
-            dec   r2
+            db    19h
 
-            ldi   uread.1               ; set input routine to use uart
-            phi   ra
-            ldi   uread.0
-            plo   ra
-
-            ldi   utype.1               ; set output routine to use uart
-            phi   rb
-            ldi   utype.0
-            plo   rb
-
-            ldi   0
-            phi   re
-
-            lbr   insmenu               ; display main installer menu
-
-
-bitbang:    ldi   input.1               ; use bit-bang uart for input
-            phi   ra
-            ldi   input.0
-            plo   ra
-
-            ldi   output.1              ; use bit-bang uart for output
-            phi   rb
-            ldi   output.0
-            plo   rb
-
-            SEMK                        ; set serial to idle level
-
-            ldi   5                    ; delay for more than one char
-            phi   r7
-settle:     dec   r7
-            ghi   r7
-            lbnz  settle
-
-            ldi   (FREQ_KHZ*5)/(SET_BAUD/25)-23
-            phi   re
-
-            lbz   insmenu               ; set baud rate constant
-            smi   1
-            phi   re
-
-
-            ; Enter the main command loop by displaying the banner message,
-            ; or the output from the previous command, and then the menu.
-
-insmenu:    mark                        ; save return x, p on stack
-            inc   r2
-
-            ldi   msgimen.1             ; pointer to menu text
-            phi   r7
-            ldi   msgimen.0
-            plo   r7
-
-            sep   rc                    ; display menu
-            dec   r2
-
-            ldi   0                     ; disable input timeout
-            plo   re
-
-
-            ; This is an abbreviated input routine that accepts a single
-            ; digit 1-5 only but acts like a line input in that it accepts
-            ; backspace and needs a return keytroke to proceed.
-
-indigit:    sep   ra                    ; get keystroke
-            dec   r2
-
-            sdi   '2'                   ; if greater than 5 try again
-            lbnf  indigit
-
-            sdi   '2'-'1'               ; if less than 1 try again
-            lbnf  indigit
-
-            plo   r9                    ; store value 0-4 meaning 1-5
-
-            adi   '1'                   ; back into digit and display
-            sep   rb
-            dec   r2
-
-
-            ; We have input a menu selection, now just look for a backspace
-            ; to undo the digit or a return to accept.
-
-ingetcr:    sep   ra                    ; get keystroke
-            dec   r2
-
-            smi   bs                    ; if backspace go do it
-            lbz   inbacks
-
-            smi   cr-bs                 ; if not return try again
-            lbnz  ingetcr
-
-
-            ; When return is pressed, output two newline sequences to 
-            ; create a blank line, then dispatch based on previous digit
-            ; that was entered.
-
-            glo   r9                    ; 1 = boot from rom
-            lbz  bootrom 
-
-            ldi   msgeban.1             ; pointer to eeprom utility banner
-            phi   r7
-            ldi   msgeban.0
-            plo   r7
-
-            lbr   eepmenu               ; 2 = eeprom utility
-
-
-            ; If a backspace received, erase the input digit and go back
-            ; to get another digit.
-
-inbacks:    ldi   msgback.1             ; pointer to backspace sequence
-            phi   r7
-            ldi   msgback.0
-            plo   r7
-
-            sep   rc                    ; output and go back to digit input
-            dec   r2
-
-            lbr   indigit               ; go back and get new digit
-
-
-            ; Boot system. Do a full initialization of stack, SCALL, and
-            ; console first as this might be called directly.
-
-bootrom:    ldi   21                    ; enough for 300 baud at 10 Mhz
-
-bootdly:    phi   rf
-            dec   rf                    ; wait for last transmitted chars
-            ghi   rf
-            bnz   bootdly
-
-         #ifdef UART_GROUP
-            ghi   re
-            lbnz  0f003h
-
-            sex   r3
-            out   EXP_PORT
+          #if UART_GROUP
+            out   EXP_PORT              ; reset to default expander group
             db    NO_GROUP
-         #endif
+          #endif
 
-            lbr   0f003h                ; boot system via bios
+            ldi   0                     ; zero bitrate to signal uart
+            phi   re
 
+            ldi   getuart               ; update input vector to uart
+            inc   rf
+            str   rf
 
-            ; Enter the main command loop by displaying the banner message,
-            ; or the output from the previous command, and then the menu.
-
-eepmenu:    mark                        ; put x, p onto stack for return
-            inc   r2
-
-            sep   rc                    ; display message
-            dec   r2
-
-            ldi   msgemen.1             ; pointer to menu text
-            phi   r7
-            ldi   msgemen.0
-            plo   r7
-
-            sep   rc                    ; display menu
-            dec   r2
-
-            ldi   0                     ; disable input timeout
-            plo   re
+            sex   r2                    ; reset x to stack pointer
+            br    continu
 
 
-            ; This is an abbreviated input routine that accepts a single
-            ; digit 1-6 only but acts like a line input in that it accepts
-            ; backspace and needs a return keytroke to proceed.
+          ; If we are using the bitbang port, then set a fixed baud rate if
+          ; SET_BAUD is set, otherwise get a keystroke to set autobaud.
+          ; Either way we start with setting the line to the idle "mark"
+          ; state and waiting until the receive side is idle.
 
-eedigit:    sep   ra                    ; get keystroke
-            dec   r2
+setbits:    SEMK                      ; set idle state for line
 
-            sdi   '6'                   ; if greater than 6 try again
-            lbnf  eedigit
+timersrt:   ldi   0                   ; Wait to make sure the line is idle,
+timeidle:   smi   1                   ;  so we don't try to measure in the
+            nop                       ;  middle of a character, we need to
+            BRSP  timersrt            ;  get 256 consecutive loops without
+            bnz   timeidle            ;  input asserted before this exits
 
-            sdi   '6'-'1'               ; if less than 1 try again
-            lbnf  eedigit
+          #ifdef SET_BAUD
+            ldi   (FREQ_KHZ*5)/(SET_BAUD/25)-23
+            br    timegot
+          #endif
 
-            plo   r9                    ; store value 0-5 meaning 1-6
+timestrt:   BRMK  timestrt            ; Stall here until start bit begins
 
-            adi   '1'                   ; back into digit and display
-            sep   rb
-            dec   r2
+            nop                       ; Burn a half a loop's time here so
+            ldi   1                   ;  that result rounds up if closer
 
+timecnt1:   phi   re                  ; Count up in units of 9 machine cycles
+timecnt2:   adi   1                   ;  per each loop, remembering the last
+            lbz   timedone            ;  time that input is asserted, the
+            BRSP  timecnt1            ;  very last of these will be just
+            br    timecnt2            ;  before the start of the stop bit
 
-            ; We have input a menu selection, now just look for a backspace
-            ; to undo the digit or a return to accept.
+timedone:   ghi   re                  ; Get timing loop value, subtract
+            smi   23                  ;  offset of 23 counts, if less than
+            bnf   timersrt            ;  this, then too low, go try again
 
-eegetcr:    sep   ra                    ; get keystroke
-            dec   r2
+timegot:    lsz                       ; Fold both 23 and 24 into zero, this
+            smi   1                   ;  adj is needed for 9600 at 1.8 Mhz
 
-            smi   bs                    ; if backspace go do it
-            lbz   eebacks
+            phi   re                  ; Got a good measurement, save it
 
-            smi   cr-bs                 ; if not return try again
-            lbnz  eegetcr
-
-
-            ; When return is pressed, output two newline sequences to 
-            ; create a blank line, then dispatch based on previous digit
-            ; that was entered.
-
-            glo   r9                    ; 1 = test xmodem
-            lbz   test
-
-            smi   1                     ; 2 = unprotect eeprom
-            lbz   unprot
-
-            smi   1                     ; 3 = program eeprom
-            lbz   program
-
-            smi   1                     ; 4 = verify eeprom
-            lbz   verify
-
-            smi   1                     ; 5 = protect eeprom
-            lbz   protect
-
-            lbr   reboot
+            ldi   putbits             ; update output vector to bit banged
+            dec   rf
+            str   rf
 
 
-            ; If a backspace received, erase the input digit and go back
-            ; to get another digit.
-
-eebacks:    ldi   msgback.1             ; pointer to backspace sequence
-            phi   r7
-            ldi   msgback.0
-            plo   r7
-
-            sep   rc                    ; output and go back to digit input
-            dec   r2
-
-            lbr   eedigit               ; go back and get new digit
 
 
-            ; Reboot the system by jumping to 8000h with X and P set to zero
-            ; as if the system was coming out of a hardware reset.
-            
-reboot:     ldi   80h                   ; load jump address to r0
+continu:    sep   scall
+            dw    inmsg
+            db    13,10,10
+            db    'Mini/ROM Utility V.4.0.0'
+            db    13,10,0
+
+            br    command
+
+
+
+
+
+contrlc:    sep   scall
+            dw    inmsg
+            db    '^C',0
+
+command:    sep   scall
+            dw    inmsg
+            db    13,10,'> ',0
+
+            ldi   buffer.1
+            phi   rf
+            ldi   buffer.0
+            plo   rf
+
+            ldi   77.0
+            plo   rc
+
+            sep   scall
+            dw    input
+            bdf   contrlc
+
+
+
+            sep   scall
+            dw    inmsg
+            db    13,10,10,0
+
+            ldi   buffer.1
+            phi   ra
+            phi   rf
+            ldi   buffer.0
+            plo   ra
+            plo   rf
+
+
+          ; Pre-process the input line to make it easier to parse. All alpha
+          ; characters are changed to lower case, any leading and trailing
+          ; spaces removed, and the input is broken into words, separated by
+          ; zero bytes, and terminate with an extra zero byte.
+       
+skipini:    lda   ra                    ; skip any leading spaces on line
+            bz     gotline
+            sdi   ' '
+            bdf   skipini
+
+nextchr:    sdi   ' '-'a'               ; fold lower case into upper case
+            lsnf
+            smi   'a'-'A'
+            adi   'a'
+
+            ori   ' '                   ; make lower case and store
+            str   rf
+            inc   rf
+
+            lda   ra                    ; skip additional word characters
+            bz    gotline
+            sdi   ' '
+            bnf   nextchr
+
+            ldi   0                     ; insert zero into string
+            str   rf
+            inc   rf
+
+skipspc:    lda   ra                    ; skip any additional spaces
+            bz    gotspac
+            sdi   ' '
+            bdf   skipspc
+
+            br    nextchr               ; get next word in string
+
+gotspac:    dec   rf                    ; if last was space then remove
+
+gotline:    ldi   0                     ; double zero to end the string
+            str   rf
+            inc   rf
+            str   rf
+
+
+          ; Check the cleaned-up command line buffer agains the list of 
+          ; commands one word at a time for a match. A prefix of each word
+          ; will be accepted so the table needs to be sorted accorbingly.
+
+            ldi   cmdtabl.1
+            phi   rc
+            ldi   cmdtabl.0
+            plo   rc
+
+            ldi   buffer.1
+            phi   rf
+
+            sex   rf
+
+
+          ; Check one command list entry. If at the end of the list, then
+          ; the command line was not matched. Otherwise, the first letter in
+          ; each word must match, otherwise skip to the next entry.
+
+chknext:    ldi   buffer
+            plo   rf
+
+nxtword:    lda   rc
+            lbz   unknown
+
+            sm
+            lbnz  skipcmd
+
+
+          ; Check the remaining letters until either the end of the word in
+          ; the command list, or until a mismatched character, which can also
+          ; mean the end of the command line word.
+
+strcomp:    inc   rf
+
+            lda   rc
+            lbz   endword
+
+            sm
+            bz    strcomp
+
+
+          ; If a mismatch, skip to the end of the command list work, and if
+          ; at the end of the command line word, treat as a prefix partial
+          ; word match. If at the end of the command list entry, we have a
+          ; match, otherwise resume matching with next word.
+
+skpword:    lda   rc
+            lbnz  skpword
+
+endword:    lda   rf
+            lbnz  chklast
+
+            lda   rc
+            bz    matched
+
+            sm
+            lbz   strcomp
+
+
+          ; If a mismatched word, then skip to the next command list entry
+          ; and test again from there.
+
+skipcmd:    lda   rc
+            bnz   skipcmd
+
+chklast:    lda   rc
+            bnz   skipcmd
+
+            inc   rc
+            inc   rc
+
+            lbr   chknext
+
+
+          ; If we have a match, pick up the routine address from the command
+          ; list and jump to it. We do this through an intermediate PC.
+
+matched:    sex   r2                    ; set x back to the stack pointer
+
+indjump:    ldi   jump_r3.1             ; temporarily change program counter
+            phi   rd
+            ldi   jump_r3.0
+            plo   rd
+
+            sep   rd                    ; swap program counter to rd
+
+jump_r3:    lda   rc                    ; load routine address into r3
+            phi   r3
+            lda   rc
+            plo   r3
+
+            sep   r3                    ; set program counter back to r3
+
+
+          ;--------------------------------------------------------------------
+          ; If the leading words on the command line cannot be matched to
+          ; an entry in the command table, then it is an unknown command.
+
+unknown:    sep   scall
+            dw    inmsg
+            db    'Unknown command',13,10,0
+
+            lbr   command
+
+
+          ;--------------------------------------------------------------------
+          ; If an argument cannot be parsed, or if there are more arguments
+          ; than expected, that that is an argument error.
+
+invalid:    sep   scall
+            dw    inmsg
+            db    'Invalid argument',13,10,0
+
+            lbr    command
+
+
+          ;--------------------------------------------------------------------
+          ; A list of commands for parsing against the command-line input.
+          ; First is a list of words separated by zero bytes, then an extra
+          ; zero byte to follow the last word, then the address of the code
+          ; that implements that command.
+
+cmdtabl:    db    'rom',0,'write',0,'enable',0,0
+            dw    writena
+
+            db    'rom',0,'write',0,'protect',0,0
+            dw    writdis
+
+            db    'rom',0,'write',0,0
+            dw    romwrit
+
+            db    'rom',0,'verify',0,0
+            dw    romvrfy
+
+            db    'rom',0,'test',0,0
+            dw    romtest
+
+            db    'rom',0,'checksum',0,0
+            dw    romchek
+
+            db    'boot',0,'rom',0,0
+            dw    bootrom
+
+            db    'boot',0,'disk',0,0
+            dw    bootdsk
+
+            db    'boot',0,0
+            dw    bootdsk
+
+            db    'reset',0,0
+            dw    doreset
+
+            db    'help',0,0
+            dw    helpmsg
+
+            db    0
+
+
+          ; ------------------------------------------------------------------
+          ; Action for "rom test" command, which intiates an XMODEM receive
+          ; but does nothing with the file, useful for just testing XMODEM.
+
+romtest:    ldi   0                     ; verify xmodem receive to eeprom
+            phi   r8
+
+            sep   scall
+            dw    inmsg
+            db    'Test',0
+
+            sep   scall                 ; initiate xmodem transfer
+            dw    rxmodem
+
+            lbr   command               ; get next command input
+
+
+          ; ------------------------------------------------------------------
+          ; Action for "rom verify" command, which intiates an XMODEM
+          ; receive transfer that is verified block-by-block against the
+          ; EEPROM.
+
+romvrfy:    ldi   X_VERIFY              ; verify xmodem receive to eeprom
+            phi   r8
+
+            sep   scall
+            dw    inmsg
+            db    'Verify',0
+
+            sep   scall                 ; initiate xmodem transfer
+            dw    rxmodem
+
+            lbr   command               ; get next command input
+
+
+          ; ------------------------------------------------------------------
+          ; Action for "rom write" command, which intiates an XMODEM
+          ; receive transfer that is programmed to the EEPROM and also
+          ; verified block-by-block. The EEPROM is automatically write-
+          ; enabled before programming, and write-protected after.
+
+romwrit:    sep   scall                 ; send eeprom command prefix
+            dw    sendpre
+
+            sep   scall                 ; send eeprom write enable command
+            dw    sendena
+
+            ldi   X_WRITE+X_VERIFY      ; write and verify eeprom
+            phi   r8
+
+            sep   scall
+            dw    inmsg
+            db    'Writ',0
+
+            sep   scall                 ; transfer, fall through to protect
+            dw    rxmodem
+
+
+          ; ------------------------------------------------------------------
+          ; Action for "rom write protect" command, which soft-write
+          ; protects the XMODEM by sending a magic number sequence.
+
+writdis:    sep   scall                 ; send eeprom command prefix
+            dw    sendpre
+
+            sep   scall                 ; send eeprom write protect command
+            dw    senddis
+
+            lbr   command               ; get next command input
+
+
+          ; ------------------------------------------------------------------
+          ; Action for "rom write enable" command, which soft-write-enables
+          ; the XMODEM by sending a magic number sequence.
+
+writena:    sep   scall
+            dw    sendpre
+
+            sep   scall
+            dw    sendena
+
+            lbr   command
+
+
+
+          ; Calculate the checksum of the ROM from $8000-FFFF
+
+romchek:    sep   scall
+            dw    inmsg
+            db    'Checksum ',0
+
+            ldi   8000h.1               ; pointer to start of rom
+            phi   ra
+            ldi   8000h.0
+            plo   ra
+
+            ldi   0                     ; clear sum accumulator
+            str   r2
+            plo   rc
+            phi   rc
+
+cheksum:    lda   ra                    ; add next byte into lsb on stack
+            add
+            str   r2
+
+            ghi   rc
+
+            bnf   nocarry               ; increment msb if carry occurred
+            inc   rc
+
+nocarry:    add
+            phi   rc
+
+            ghi   ra                    ; loop until address rolls over
+            bnz   cheksum
+
+            ldn   r2                    ; save checksum msb
+            plo   r8
+
+
+          ; Move the MSB and LSB into RD.1 and RD.0 where they need to be,
+          ; then convert to hex string for output.
+
+            dec   ra                    ; display checksum from rom
+            dec   ra
+
+            sep   scall
+            dw    hexchek
+
+            ghi   rc
+            bnz   chekerr
+
+            sex   ra
+
+            dec   ra
+            glo   r8
+            sm
+            bnz   chekerr
+
+            dec   ra
+            glo   rc
+            sm
+            bnz   chekerr
+
+            sep   scall
+            dw    inmsg
+            db    ' OK',13,10,0
+
+            lbr   command
+
+chekerr:    sep   scall
+            dw    inmsg
+            db    ' FAIL',13,10,0
+
+            lbr   command
+
+
+hexchek:    sep   scall
+            dw    hexbyte
+
+hexbyte:    ldn   ra
+
+            shr
+            shr
+            shr
+            shr
+
+            sep   scall
+            dw    hexnibl
+
+            lda   ra
+            ani   15
+
+hexnibl:    smi   10
+            lsnf
+            adi   'A'-'0'-10
+            adi   '0'+10
+
+            lbr   type
+
+
+          ; ------------------------------------------------------------------
+          ; Action for "help" command which dumps the command parsing table
+          ; to display a list of all possible commands.
+
+helpmsg:    ldi   cmdtabl.1
+            phi   rf
+            ldi   cmdtabl.0
+            plo   rf
+
+            br    helpmor
+
+helpspc:    ldi   ' '
+            sep   scall
+            dw    type
+
+helpmor:    sep   scall
+            dw    msg
+
+            ldn   rf
+            bnz   helpspc
+
+            inc   rf
+            inc   rf
+            inc   rf
+
+            sep   scall
+            dw    inmsg
+            db    13,10,0
+
+            ldn   rf
+            lbz   command
+
+            br    helpmor
+
+
+          ; ------------------------------------------------------------------
+          ; Action for "boot disk" command which boots the system from disk
+          ; by jumping into the $F000 vector in BIOS which is the default
+          ; boot entry point.
+
+bootdsk:    ldi   0f000h.0              ; set lsb and then fall through
+            lskp
+
+
+          ; ------------------------------------------------------------------
+          ; Action for "boot rom" command which boots the system from the ROM
+          ; disk image by jumping into the $F003 vector in BIOS which is the
+          ; alternate boot entry point for this purpose.
+
+bootrom:    ldi   0f003h.0              ; set the entry point address
+            plo   r0 
+            ldi   0f003h.1
             phi   r0
-            ldi   00h
+
+            sep   scall                 ; display a notice before jumping
+            dw    inmsg
+            db    'Booting system.',0
+
+            sep   r0                    ; change pc to r0 and jump
+
+
+          ; ------------------------------------------------------------------
+          ; Action for "reset" command which restarts the system as reset
+          ; would, at least from a software perspective. This differs from
+          ; "boot disk" as it might cause the unlity to get re-entered.
+
+doreset:    sep   scall                 ; display message before going
+            dw    inmsg
+            db    'Resetting system.',0
+
+            ldi   8000h.1               ; get address of start of rom
+            phi   r0
+            ldi   8000h.0
             plo   r0
 
-            sex   r0                    ; set x and p to zero
-            sep   r0
+            sep   r0                    ; change pc to r0 and jump
 
 
-            ; Protect or unprotect the EEPROM by issuing the necessary
-            ; sequence of location writes. Either of the two entry points
-            ; will be called with D=0 and DF=1; we use DF as the flag for
-            ; which operation by clearing it for protect.
+          ; ------------------------------------------------------------------
+          ; Send the command prefix to the EEPROM to initiate either a soft
+          ; write-protect or write-enable command.
 
-protect:    shr                         ; clear df flag
+sendpre:    sep   scall                 ; display message
+            dw    inmsg
+            db    'ROM write ',0
 
-unprot:     ldi   55h+80h               ; first magic address for algorithm
+            ldi   55h+80h               ; first magic address for algorithm
             phi   r7
             ldi   55h
             plo   r7
-            
+
             ldi   2ah+80h               ; second magic address for algorithm
             phi   r8
             ldi   0aah
             plo   r8
-            
+
             ldi   0aah                  ; 1st write for either: aa->5555
             str   r7
 
             ldi   055h                  ; 2nd write for either: 55->2aaa
             str   r8
 
-            lbdf  isunpro               ; if unprotect, branch here
+            sep   sret
 
-            ldi   0a0h                  ; 3rd write for protect: a0->5555
+
+          ; ------------------------------------------------------------------
+          ; Send the command suffix to the EEPROM to soft write-protect.
+
+senddis:    ldi   0a0h                  ; 3rd write for protect: a0->5555
             str   r7
 
-            ldi   msgprot.1             ; pointer to protected message
-            phi   r7
-            ldi   msgprot.0
-            plo   r7
-            
-            lbr   eepmenu               ; output message, return to menu
-            
+            sep   scall                 ; display message
+            dw    inmsg
+            db    'protected',13,10,0
 
-            ; Output the remainder of the write sequence for unprotect.
+            sep   sret                  ; return to caller
 
-isunpro:    ldi   080h                  ; 3rd write for unprotect: 80->5555
+
+          ; ------------------------------------------------------------------
+          ; Send the command suffix to the EEPROM to soft write-protect.
+
+sendena:    ldi   080h                  ; 3rd write for unprotect: 80->5555
             str   r7
-            
+
             ldi   0aah                  ; 4th write for unprotect: aa->5555
             str   r7
 
@@ -467,652 +742,841 @@ isunpro:    ldi   080h                  ; 3rd write for unprotect: 80->5555
             ldi   020h                  ; 6th write for unprotect: 20->5555
             str   r7
 
-            ldi   msgunpr.1             ; pointer to unprotected message
-            phi   r7
-            ldi   msgunpr.0
+            sep   scall                 ; display message
+            dw    inmsg
+            db    'enabled.',13,10,0
+
+            sep   sret                  ; return to caller
+
+
+          ; ASCII control character definitions used for XMODEM protocol.
+
+#define NUL 0       ; null is used instead of zero
+#define SOH 1       ; start-of-header starts 128-byte packet
+#define ETX 3       ; end-of-test recognized to cancel (control-c)
+#define EOT 4       ; end-of-text is received after all packets
+#define ACK 6       ; acknowledge is send following a valid packet
+#define NAK 21      ; negative acknowledgement is sent after an error
+#define CAN 24      ; cancel to abort transmission and abandon file
+
+
+          ; ------------------------------------------------------------------
+
+rxmodem:    sep   scall
+            dw    inmsg
+            db    'ing XMODEM...',0
+
+            ghi   re
+            bz    setuart
+
+            ldi   tmobits.0             ; set routines for uart console port
             plo   r7
-
-            lbr   eepmenu               ; output message, return to menu
-
-
-            ; Test command - display prompt, load function, and run.
-
-test:       ldi   msgtest.1             ; test xmodem prompt pointer
+            ldi   putbits.0
             phi   r7
-            ldi   msgtest.0
+
+            br    prepare
+
+setuart:    ldi   tmouart.0             ; set routines for uart console port
             plo   r7
-
-            ldi   0                     ; function code for test
-            lbr   xmodem
-
-
-            ; Program command - display prompt, load function, and run.
-
-program:    ldi   msgprog.1             ; program xmodem prompt pointer
-            phi   r7
-            ldi   msgprog.0
-            plo   r7
-
-            ldi   1                     ; function code for program
-            lbr   xmodem
-
-
-            ; Verify command - display prompt, load function, and run.
-
-verify:     ldi   msgverf.1             ; verify xmodem prompt pointer
-            phi   r7
-            ldi   msgverf.0
-            plo   r7
-
-            ldi   2                     ; function code for verify
-            lbr   xmodem
-
-
-            ; Save the function code into R9.1, output the prompt message,
-            ; and fall into the main XMODEM routine.
-
-xmodem:     phi   r9                    ; save requested mode
-
-            sep   rc                    ; output prompt passed in r7
-            dec   r2
-
-
-            ; This XMODEM receive code performs the following three functions
-            ; around receiving a file based on the selector passed in R9.1:
-            ;
-            ;   0: Test - this receives a file but does nothing with the
-            ;      data received. The purpose is to verify that XMODEM can
-            ;      be successfully run before attempting a write operation.
-            ;
-            ;   1: Program - this receives a file and writes it to the 
-            ;      EEPROM a block at a time, and verifies each block after.
-            ;
-            ;   2: Verify - this receives a file and compares it to the
-            ;      existing EEPROM contents.
-            ;
-            ; Upon success, the same code is returned that was passed in.
-            ; On failure, the code n R9.1 is changed to the following:
-            ;
-            ;   3: Failed - the verification of data failed, either as part
-            ;      of a program operation, or as a verify operation.
-            ;
-            ; Besides the mode passed in R9.1, this uses the following
-            ; registers internally:
-            ;
-            ;   R7:   Pointer to receive buffer
-            ;   R8:   Pointer to EEPROM location
-            ;   R9.0: Packet number being received
-            ;   RF.0: Calculation of checksum
-            ;
-            ; Note that the buffer needs to be page aligned as a test for 
-            ; zero is used to detect a full packet has been received (the
-            ; buffer is filled from top down).
-
-            sex   r7                    ; use buffer pointer for index 
-
-            ldi   buffer.1              ; set msb of buffer pointer
+            ldi   putuart.0
             phi   r7
 
-            dec   r2                    ; do a mark to the stack once, keep
-            mark                        ;  using it over and over to same time
-            inc   r2
 
-            ldi   80h                   ; set r8 to point to start of eeprom
-            phi   r8
-            ldi   00h
+          ; Now that the UART is selected switch up the program counter
+          ; and subroutine counter to prepare for transfer.
+
+prepare:    ldi   startit.1             ; switch program counter now to r5
+            phi   r5
+            ldi   startit.0
+            plo   r5
+
+            sep   r5                    ; continues below with p as r5
+
+
+          ; We are running with R6 as the program counter now. Initialize
+          ; the one-time things we need for the transfer.
+
+startit:    ldi   1                     ; first expected packet is one
             plo   r8
 
-            ldi   1                     ; start packet sequence at one
-            plo   r9
-
-            lbr   flushin               ; branch to packed receive code
-
-            ; The inner part of the XMODEM code is timing sensitive and needs
-            ; to use short branch instructions, so it is located in a block
-            ; of code that is page aligned. Think of it as being here.
-
-havepkt:    sdi   0                     ; negate the checksum returned
-            plo   rf
-
-            ldi   128                   ; reset receive buffer to start
-            plo   r7
-
-calcsum:    glo   rf                    ; add each byte to the checksum
-            add 
-            plo   rf
-
-            dec   r7                    ; repeat until at end of buffer
-            glo   r7
-            lbnz  calcsum
-
-            glo   rf                    ; if result not zero, then nak
-            lbnz  sendnak
-
-
-            ; At this point we have received a packet verified to be good.
-
-            ghi   r9                    ; retrieve function code
-
-            smi   1                     ; if 1, program block to EEPROM
-            lbz   write
-
-            smi   1                     ; if 2, verify block against EEPROM
-            lbz   check
-
-
-            ; If neither a program nor verify operation, including if we
-            ; have failed to verify a block, fall through and process the
-            ; block without doing anything with the data.
-
-nextpkt:    ldi   128                   ; reset buffer pointer to start
-            plo   r7
-
-            glo   r9                    ; increate packet sequence counter
-            adi   1
-            plo   r9
-
-            ldi   ack                   ; send an ack and get next packet
-            lbr   sendack
-
-
-            ; If an EEPROM program operation, then write this packet
-            ; to EEPROM in block mode (which will take two EEPROM blocks
-            ; per XMODEM packet). Fall through to verify each packet.
-
-write:      ldi   128                   ; reset buffer pointer to start
-            plo   r7
-
-            sex   r8                    ; verify against eeprom data
-
-wrtloop:    ldn   r7                    ; program byte to eeprom
-            str   r8
-
-            glo   r8                    ; if not the end of a block, then
-            ani   63                    ;  skip ahead to write next byte
-            xri   63
-            lbnz  noblock
-
-wrtwait:    ldn   r8                    ; wait until bit 6 of consecutive
-            xor                         ;  reads from the eeprom are the same
-            ani   40h
-            lbnz  wrtwait
-
-noblock:    inc   r8                    ; advance source and target pointers
-            dec   r7
-
-            glo   r7                    ; if not end of packet, continue
-            lbnz  wrtloop
-
-            sex   r7                    ; back to pointing to buffer
-
-            glo   r8                    ; set eeprom address back to start
-            smi   128                   ;  of block, fall through to verify
-            plo   r8
-            ghi   r8
-            smbi  0
-            phi   r8
-
-
-            ; Verify packet against EEPROM contents, if failure, then set
-            ; the failure mode code into R9.1 but keep going. We can't
-            ; interrupt the XMODEM file receive even if there's an error.
-
-check:      ldi   128                   ; set buffer pointer to start
-            plo   r7
-            
-chkloop:    ldn   r8                    ; if byte matches, go on to next
-            xor
-            lbz   chkgood
-
-            ldi   3                     ; if mismatch, set failure code
-            phi   r9
-            
-chkgood:    dec   r7                    ; advance source and target pointers
-            inc   r8
-            
-            glo   r7                    ; loop until all packet checked
-            lbnz  chkloop
-
-            lbr   nextpkt               ; continue to next packet
-
-
-            ; If transfer was cancelled, send an ACK and then display
-            ; cancelled message and return to menu.
-
-cancel:     ldi   ack                   ; send ack to cancel command
-            sep   rb
-
-            ldi   msgcanc.1             ; get pointer to cancelled message
-            phi   r7
-            ldi   msgcanc.0
-            plo   r7
-
-            lbr   eepmenu               ; display message, return to menu
-
-
-            ; At end of file, see if there was an error and display the
-            ; appropriate message, then return to the menu.
-
-endfile:    ldi   ack                   ; send ack to end-of-file command
-            sep   rb
-
-            ghi   r9                    ; if code is still 1 or 2, success
-            smi   3
-            lbnf  success
-
-            ldi   msgfail.1             ; get pointer to failure message
-            phi   r7
-            ldi   msgfail.0
-            plo   r7
-
-            lbr   eepmenu               ; display message, return to menu
-            
-success:    ldi   msggood.1             ; get pointer to success message
-            phi   r7
-            ldi   msggood.0
-            plo   r7
-
-            lbr   eepmenu               ; display message, return to menu
-
-
-
-
-uinput:     inp    UART_DATA
-
-upopret:    inc    r2
-            ret
-
-uread:      sex    r2
-            dec    r2
-
-uwait:      inp    UART_STATUS
-            shr
-            lbdf   uinput
-
-            glo    re
-            lbz    uwait
-
-            phi    rf
-            ldi    255
-            plo    rf
-
-udelay1:    ldi    170
-            plo    re
-
-udelay2:    inp    UART_STATUS
-            shr
-            lbdf   uinput
-
-            dec    re
-            glo    re
-            lbnz   udelay2
-
-            dec    rf
-            ghi    rf
-            lbnz   udelay1
-
-            lbr    upopret
-
-
-
-ureturn:    ret
-
-utype:      sex   r2
-            dec   r2
-            stxd
-           
-uisbusy:    inp   UART_STATUS
-            shl
-            lbnf  uisbusy
-
-            inc   r2
-            out   UART_DATA
-
-            lbr   ureturn
-
-
-; ---------------------------------------------------------------------------
-; message
-;
-; output a message from memory up to but not including a terminating null.
-;
-; entry                      ;
-;   r7   - points to message to output
-;   re.1 - baud rate constant
-;
-; exit:
-;   d    - set to zero
-;   r7   - left pointing to the terminating null
-;   rf.0 - modified
-
-msgret:     inc   r2
-            sex   r2
-            ret
-
-message:    dec   r2
-            mark
-            inc   r2
-
-mesglp:     lda   r7
-            lbz   msgret
-            
-            sep   rb
-            dec   r2
-
-            lbr   mesglp
-
-
-
-msgimen:    db    cr,lf,cr,lf
-            db    "Mini/ROM Utility V.VERSION",cr,lf
-
-            db    cr,lf
-            db    "1. Boot from ROM",cr,lf
-            db    "2. EEPROM Utility",cr,lf
-            db   cr,lf
-            db    "   Option ? ",0
-
-msgeban:    db   cr,lf,cr,lf,0
-
-msgemen:    db   cr,lf
-            db   "1. Test XMODEM",cr,lf
-            db   "2. Unprotect EEPROM",cr,lf
-            db   "3. Program EEPROM",cr,lf
-            db   "4. Verify EEPROM",cr,lf
-            db   "5. Protect EEPROM",cr,lf
-            db   "6. Restart",cr,lf
-            db   cr,lf
-            db   "   Option ? ",0
-
-msgunpr:    db   cr,lf,cr,lf,"EEPROM Write Enabled!",cr,lf,0
-msgprot:    db   cr,lf,cr,lf,"EEPROM Write Protected!",cr,lf,0
-msgtest:    db   cr,lf,cr,lf,"Send XMODEM to Test... ",0
-msgprog:    db   cr,lf,cr,lf,"Send XMODEM to Program... ",0
-msgverf:    db   cr,lf,cr,lf,"Send XMODEM to Verify... ",0
-msggood:    db   "Success!",cr,lf,0
-msgfail:    db   "Failure!",cr,lf,0
-msgcanc:    db   "Cancelled!",cr,lf,0
-
-msgback:    db   bs,' ',bs,0
-msgline:    db   cr,lf,cr,lf,0
-
-            org  (0ffh + $) & 0ff00h
-
-; ---------------------------------------------------------------------------
-; input
-;
-; receive a byte from the soft uart optionally with a timeout in case no
-; character is received. to receive back-to-back bytes continuously at the
-; maximum baud rate, you need to call this again no more than 18 machine
-; cycles after it returns, including the sep instruction itself.
-;
-; entry:
-;   re.0 - timeout delay (0 to disable)
-;   re.1 - baud rate constant
-;
-; exit:
-;   on success, d is byte and df is set
-;   on timeout, d is zero and df is cleared
-;
-;   rf.0 - modified (copy of byte if success)
-;   rf.1 - modified
-
-
-inpspc:     smi   0                     ; sets df for one bit, clear for zero
-
-inpmrk:     glo   rf                    ; get current received value and shift
-            shrc                        ;  right, shifting new bit in as the 
-            plo   rf                    ;  next higher bit. when all initial
-            bnf   inpdly                ;  zeros are shifted out, we are done
-
-inpwai:     BRSP  inpwai                ; if last bit was mark then wait
-
-inpret:     sex   r2
-            ret
-
-; entry point here
-
-input:      BRSP  inpbeg
-            glo   re
-            
-inpinf:     BRSP  inpbeg
-            bz    inpinf
-
-            BRSP  inpbeg
+            ldi   buffer.1              ; set buffer pointer to start
             phi   rf
 
-            BRSP  inpbeg
-            ldi   255
+            ldi   8000h.1
+            phi   ra
+            ldi   8000h.0
+            plo   ra
 
-            BRSP  inpbeg
+
+          ; All of our subroutines are in the same page so we will set the
+          ; high byte of the address into r3 once here, and we will set the
+          ; low bytes for send and receive into r7 high and low bytes based
+          ; on which interface we are using.
+
+            ldi   getuart.1             ; set msb to the subroutine page
+            phi   r3
+
+            glo   r7                    ; set subroutine pointer to input
+            plo   r3
+
+            lbr   waitnak
+
+            org   (($-1)|255)+1
+
+
+          ; Flush the input until nothing has been received for about one
+          ; second by calling input repeatedly until it times out. Then fall
+          ; though and send a NAK character.
+
+waitnak:    ldi   51                    ; keep getting input until timeout
+            sep   r3
+            bnf   waitnak
+
+
+          ; Send a NAK to provoke the sender to either start transmitting or
+          ; to resend the last packet because it was in error.
+            
+sendnak:    ghi   r7                    ; set pointer to send byte routine
+            plo   r3
+
+            ldi   NAK                   ; send the NAK to transmitter
+            sep   r3
+
+
+          ; Receive the start of a packet, which for a normal XMODEM packet
+          ; will be a SOH character.
+
+recvsoh:    ldi   buffer                ; reset pointer to current buffer
             plo   rf
 
-inprst:     BRSP  inpbeg
-            ldi   255
+            ldi   255                   ; get byte, nak if long timeout
+            sep   r3
+            bdf   sendnak
 
-inptim:     BRSP  inpbeg
-            smi   1
-
-            BRSP  inpbeg
-            bdf   inptim
-
-            BRSP  inpbeg
-            dec   rf
-
-            BRSP  inpbeg
-            ghi   rf
-
-            BRSP  inpbeg
-            bnz   inprst
-
-            br    inpret
-
-inpbeg:     ldi   80h                       ; initial register value, we will
-            plo   rf                        ;  shift right until 1 shifts out
-
-inpskp:     ghi   re                        ; get delay per bit and divide by
-            shr                             ;  two to get to middle of the bit
-
-inplp1:     smi   4                         ; delays for cycles equal to next
-            bdf   inplp1                    ;  multiple of 4 of the value of d
-
-            sdi   (inpjp1-1).0              ; above will leave -1 to -4 in d
-            plo   ra                        ;  which is the remainder of the
-inpjp1:     skp                             ;  machine cycles we need to delay
-            skp                             ;  then delays for 6 to 9 cycles
-            lskp                            ;  for values of -4 to -1
-            ldi   0                         ;  last instr is just 2 cycles
-
-inpdly:     ghi   re
-
-inplp2:     smi   4                         ; delays for cycles equal to next
-            bdf   inplp2                    ;  multiple of 4 of the value of d
-
-            sdi   (inpjp2-1).0              ; above will leave -1 to -4 in d
-            plo   ra                        ;  which is the remainder of the
-inpjp2:     skp                             ;  machine cycles we need to delay
-            skp                             ;  then delays for 6 to 9 cycles
-            lskp                            ;  for values of -4 to -1
-            ldi   0                         ;  last instr is just 2 cycles
-
-            BRMK  inpspc                    ; if not ef2 then space, go set df,
-            br    inpmrk                    ;  otherwise mark, leave df clear
-
-
-; ---------------------------------------------------------------------------
-; output
-;
-; transmit a byte through the soft uart. note that this delays for one bit
-; time upon entry so that it can be called back to back without causing stop
-; bit violations. this is done at entry rather than exit so that input can
-; be called immediately after output without missing the start of a byte
-; incoming in response to what was transmitted.
-;
-; entry:
-;   d    - byte to send
-;   re.1 - baud rate constant
-;
-; exit:
-;   rf.0 - modified
-
-
-outstp:     SEMK
-            ret
-
-output:     sex   r2
-
-            plo   rf
-            
-            ghi   re
-outdl1:     smi   4
-            bdf   outdl1                    ; 4,8,12,16
-
-            sdi   (outjp1-1).0
-            smi   0                         ; set df
-            plo   rb
-
-outjp1:     skp
-            skp
-            lskp
-            ldi   0                         ; 6,7,8,9
-
-            ghi   re
-            SESP
-            
-outdl2:     smi   4
-            bdf   outdl2                    ; 4,8,12,16
-
-            sdi   (outjp2-1).0
-            smi   0                         ; set df
-            plo   rb
-
-outjp2:     skp
-            skp
-            lskp
-            ldi   0                         ; 6,7,8,9
-
-            glo   rf
-            shrc
-            plo   rf
-
-            bz    outstp
-            bdf   outseq
-
-            SESP
-
-            ghi   re
-outdl3:     smi   4
-            bdf   outdl3                    ; 4,8,12,16
-
-            sdi   (outjp2-1).0              ; always clears df
-            plo   rb
-
-outseq:     SEMK
-
-            ghi   re
-outdl4:     smi   4
-            bdf   outdl4                    ; 4,8,12,16
-
-            sdi   (outjp2-1).0              ; always clears df
-            plo   rb
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-flushin:    ldi   1                     ; short timeout
-            plo   re
-
-            sep   ra
-            dec   r2
-
-            bdf   flushin
-
-sendnak:    ldi   5                     ; timeout value
-            plo   re
-
-            ldi   128
-            plo   r7
-
-            ldi   nak
-            
-sendack:    sep   rb
-            dec   r2
-            
-            sep   ra                     ; get packet
-            dec   r2                     ; repoint to values from mark
-
-            bnf   sendnak
-
-            xri   soh
+            xri   SOH^NUL               ; if soh then start of regular packet  
             bz    recvpkt
 
-            xri   eot ^ soh
-            lbz   endfile
-            
-            xri   can ^ eot
-            lbz   cancel
-            
-            xri   etx ^ can
-            lbz   cancel
+            xri   EOT^SOH               ; if eot then transfer is all done
+            bz    alldone
 
-            br    flushin
-            
-recvpkt:    sep   ra                     ; get packet
-            dec   r2                     ; repoint to values from mark
+            xri   ETX^EOT               ; if eot then transfer is all done
+            bz    abandon
 
-            str   r7
-            out   4
-            dec   r7
+            xri   CAN^ETX               ; if eot then transfer is all done
+            bz    abandon
 
-            str   r7
-            glo   r9
+            br    waitnak               ; any thing else, flush input and nak
+
+
+          ; Get the block number and block number check byte and save for
+          ; checking later. We do this outside of the data read so that it
+          ; doesn't clog up the stacking of data segments in the buffer.
+
+recvpkt:    ldi   51                    ; get block number, nak if timeout
+            sep   r3
+            bdf   sendnak
+
+            plo   r9                    ; save to check later on
+
+            ldi   51                    ; get block check, nak if timeout
+            sep   r3
+            bdf   sendnak
+
+            phi   r9                    ; save to check later on
+
+
+          ; Read the 128 data bytes into the buffer. Since the buffer is page-
+          ; aligned, the XMODEM blocks will be half-page aligned to we can use
+          ; the buffer index as the counter also.
+
+nextpkt:    ldi   51                   ; get data byte, nak if timeout
+            sep   r3
+            bdf   sendnak
+
+            str   rf                   ; write byte into buffer and advance
+            inc   rf
+
+            glo   rf                   ; repeat until at 128 byte boundary
+            ani   %1111111
+            bnz   nextpkt
+
+
+          ; Read the final byte of the packet, the checksum. Save this for the
+          ; moment, we will check it later when we calculate the checksum.
+
+            ldi   51                   ; get the checksum, nak if timeout
+            sep   r3
+            bdf   sendnak
+
+            plo   re                   ; save into accumulator for checksum
+
+
+          ; Check that the block number is valid (the block and block check
+          ; are one's complements) and that the block is the one we are 
+          ; expecting. As a special case, if we see the prior block again,
+          ; send an ACK so that the transmitter will move forward.
+
+            glo   r9                    ; its easier if we add 1 to block
+            adi   1
+            str   r2
+
+            ghi   r9
+            add                         ; if check fails then wait and nak
+            bnz   waitnak
+
+            glo   r8                    ; if prior block then wait and ack
+            sm
+            bz    waitack
+
+            adi   1                     ; if not expected then wait and nak
+            bnz   waitnak
+
+
+          ; Calculate the checksum of the data by subtracting all the data
+          ; bytes from the checksum byte. If everything is correct, the result
+          ; will be zero. The loop is unrolled by a factor of four for speed.
+
+            ldi   buffer                ; reset pointer to start of packet
+            plo   rf
+
+            sex   rf                    ; argument for sm will by data bytes
+
+sumloop:    glo   re                    ; subtrack four data bytes from sum
+            sm
+            inc   rf
+            sm
+            inc   rf
+            sm
+            inc   rf
+            sm
+            inc   rf
+            plo   re
+
+            glo   rf                    ; repeat until 128 byte boundary
+            ani   %1111111
+            bnz   sumloop
+
+            sex   r2                    ; set x back to r2 stack pointer
+
+            glo   re                    ; error if sum not zero, flush and nak
+            bnz   waitnak
+
+
+          ; If an EEPROM program operation, then write this packet
+          ; to EEPROM in block mode (which will take two EEPROM blocks
+          ; per XMODEM packet). Fall through to verify each packet.
+
+            ghi   r8                    ; check flag if not first packet
+            ani   X_WRITE
+            bz    verify
+
+            ldi   buffer                ; reset buffer pointer to start
+            plo   rf
+
+            ghi   ra                    ; get pointer to eeprom block
+            phi   rd
+            glo   ra
+            plo   rd
+
+            sex   rd                    ; verify against eeprom data
+
+wrtloop:    lda   rf                    ; program byte to eeprom
+            str   rd
+
+            glo   rf                    ; write until end of 64-byte block
+            ani   63
+            bnz   noblock
+
+wrtwait:    ldn   rd                    ; wait until bit 6 reads same twice
             xor
-            bnz   flushin
+            ani   64
+            bnz   wrtwait
 
-            sep   ra
-            dec   r2
+noblock:    inc   rd                    ; advance source and target pointers
 
-            xri   0ffh
+            glo   rf                    ; loop until all packet checked
+            ani   127
+            bnz   wrtloop
+
+
+          ; Verify packet against EEPROM contents, if failure, then set
+          ; the failure mode code into R9.1 but keep going. We can't
+          ; interrupt the XMODEM file receive even if there's an error.
+
+verify:     ghi   r8                    ; check flag if not first packet
+            ani   X_VERIFY
+            bz    nowrite
+
+check:      ldi   buffer                ; set buffer pointer to start
+            plo   rf
+
+            ghi   ra                    ; get pointer to eeprom block
+            phi   rd
+            glo   ra
+            plo   rd
+
+            sex   rd                    ; verify against eeprom data
+
+chkloop:    lda   rf                    ; if byte matches, go on to next
             xor
-            bnz   flushin
+            bz    chkgood
 
-            ldi   128
-            plo   r7
-            
-pktloop:    sep   ra
-            dec   r2
-            bnf   sendnak               ; timeout
+            ghi   r8                    ; else set error and unset verify
+            xri   X_VERIFY+X_ERROR
+            phi   r8
 
+            br    nowrite               ; abandon rest of this block
+
+chkgood:    inc   rd                    ; advance to next eeprom byte
+
+            glo   rf                    ; loop until all packet checked
+            ani   127
+            bnz   chkloop
+
+
+          ; Get ready for the next block: increment the block number and
+          ; set the buffer pointer just following the block just received.
+
+nowrite:    sex   r2                    ; point back to stack
+
+            ghi   r8                    ; increment block number
+            inc   r8
+            phi   r8
+
+            glo   ra                    ; advance to next eeprom block
+            adi   127
+            plo   ra
+            inc   ra
+
+
+          ; As a special case, that occurs with Tera Term, for example, the
+          ; receiving side may queue multiple NAKs before it is ready to 
+          ; send, and then send the first packet multiple times as a result.
+          ; To help recover from this quickly, flush any remaining input only
+          ; after the first packet, using a quick timeout.
+
+            ghi   r8                    ; check flag if not first packet
+            ani   X_FIRST
+            bnz   sendack
+
+            ghi   r8                    ; if flag not set, set it now
+            ori   X_FIRST
+            phi   r8
+
+            ldi   10                    ; set a very short timeout then wait
+            lskp
+
+
+          ; If a packet is received that is a duplicate of the last packet,
+          ; then some kind of loss or corruption has occurred. To aid in error
+          ; recovery, flush any remaining input before sending an ACK.
+
+waitack:    ldi   51                    ; read input until there is no more
+            sep   r3
+            bnf   waitack
+
+
+          ; Send an ACK immediately in response to the good packet, and loop
+          ; back and get the next packet.
+
+sendack:    ghi   r7                    ; set subroutine pointer to send
+            plo   r3
+
+            ldi   ACK                   ; send ack since a good packet
+            sep   r3
+
+            br    recvsoh               ; and then get the next packet
+
+
+
+abandon:    ldi   msgcanc.1
+            phi   rf
+            ldi   msgcanc.0
+            plo   rf
+
+            br    xreturn
+
+
+          ; After the last data packet, acknowledge the EOT end marker, then
+          ; return back to the normal program counter and SCRT setup for
+          ; final file operations and return to kernel.
+
+alldone:    ghi   r7                    ; set subroutine pointer to send
+            plo   r3
+
+            ldi   ACK                   ; acknowledge end of packets
+            sep   r3
+
+            ghi   r8
+            ani   X_ERROR
+            bz    noerror
+
+errcomp:    ldi   msgfail.1
+            phi   rf
+            ldi   msgfail.0
+            plo   rf
+
+            br    xreturn
+
+noerror:    ldi   msgcomp.1
+            phi   rf
+            ldi   msgcomp.0
+            plo   rf
+
+
+          ; Restore the normal SCRT environment by switch PC back to R3 and
+          ; resetting R5 to sret routine. Output final status message.
+
+xreturn:    ldi   retrest.1
+            phi   r3
+            ldi   retrest.0
+            plo   r3
+
+            sep   r3
+
+retrest:    ldi   ret.1
+            phi   r5
+            ldi   ret.0
+            plo   r5
+
+            sep   scall
+            dw    msg
+
+            sep   sret
+
+msgfail:    db    'VERIFY FAILED.',13,10,0
+msgcomp:    db    'succeeded.',13,10,0
+msgcanc:    db    'CANCELLED.',13,10,0
+
+
+          ; Reset the system to the normal SCRT environment by restoring r5
+          ; and r3 and resetting the program counter to r3. Also restore the
+          ; echo flag in RE.1.
+
+
+callbr:     glo   re
+            sep   r3                    ; jump to called routine
+
+            ; Entry point for CALL here.
+
+call:       plo   re                    ; Save D
+            sex   r2
+
+            glo   r6                    ; save last R[6] to stack
+            stxd
+            ghi   r6
             stxd
 
-            glo   r7
-            bnz   pktloop
+            ghi   r3                    ; copy R[3] to R[6]
+            phi   r6
+            glo   r3
+            plo   r6
 
-            sep   ra
-            dec   r2
-            bnf   sendnak               ; timeout
+            lda   r6                    ; get subroutine address
+            phi   r3                    ; and put into r3
+            lda   r6
+            plo   r3
 
-            lbr   havepkt
-
-
-            ; The buffer needs to start at a page boundary as XMODEM fills
-            ; it frm the top down and relies on the low byte hitting zero
-            ; to count the packet input bytes. So put it at the start of
-            ; the next page after all the code.
-
-buffer:     equ   (($ + 0ffh) & 0ff00h)
+            br    callbr                ; transfer control to subroutine
 
 
-end:        ; thats all folks!
+retbr:      glo   re                    ; restore d and jump to return
+            sep   r3                    ;  address taken from r6
+
+            ; Entry point for RET here.
+
+ret:        plo   re                    ; save d and set x to 2
+            sex   r2
+
+            ghi   r6                    ; get return address from r6
+            phi   r3
+            glo   r6
+            plo   r3
+
+            irx                         ; restore next-prior return address
+            ldxa                        ;  to r6 from stack
+            phi   r6
+            ldx
+            plo   r6
+
+            br    retbr                 ; jump back to continuation
+
+
+
+
+
+
+
+
+            org   (($-1)|255)+1
+
+
+input:      ldi   0
+            plo   rd
+
+inloop:     sep   scall
+            dw    read
+
+            smi   127
+            bdf   inloop
+
+            adi   127-32
+            bdf   print
+
+            adi   32-13
+            bz    cr
+
+            adi   13-8
+            bz    bs
+
+            adi   8-3
+            bnz   inloop
+
+            ldi   1
+
+cr:         shr
+            str   rf
+
+            sep   sret
+
+print:      glo   rc
+            bz    inloop
+
+            glo   re
+            str   rf
+
+            inc   rf
+            inc   rd
+            dec   rc
+
+            glo   re
+            sep   scall
+            dw    type
+
+            br    inloop
+
+bs:         glo   rd
+            bz    inloop
+
+            dec   rf
+            dec   rd
+            inc   rc
+
+            sep   scall
+            dw    inmsg
+            db    8,32,8,0
+
+            br    inloop
+
+
+msgloop:    sep   scall
+            dw    type
+
+msg:        lda   rf
+            bnz   msgloop
+
+            sep   sret
+
+
+inmloop:    sep   scall
+            dw    type
+
+inmsg:      lda   r6
+            bnz   inmloop
+
+            sep   sret
+
+
+
+
+
+
+          ; ------------------------------------------------------------------
+          ; These vectors will be used for general calls for console input
+          ; and output via SCRT and will be updated during UART detection
+          ; and initialization. We will start with one them pointing to
+          ; opposite routines so only one has to be updated. Because all of
+          ; the code will be copied to RAM before running, these will be 
+          ; able to be updated even though the utility is stored in RAM.
+
+type:       br    putuart
+read:       br    getbits
+
+
+          ; ------------------------------------------------------------------
+          ; This implements a receive byte with timeout function for the UART
+          ; using BIOS routines by polling with F_UTEST to check if a byte is
+          ; received while counting down a timer. To do this all quickly 
+          ; enough, a special calling routine is used; see the notes elsewhere
+          ; for a detailed explanation.
+          ;
+          ; The routine is folded on itself so that the return resets the
+          ; subroutine instruction pointer back to the beginning of the routine
+          ; so that it can quickly be called again.
+
+getuart:    ;;;                         ; can't put a label on #if line
+
+          #if UART_GROUP
+            sex   r3
+            out   EXP_PORT
+            db    UART_GROUP
+            sex   r2
+          #endif
+
+uartzer:    inp   UART_STATUS           ; wait forever until received
+            shr
+            bnf   uartzer
+
+uartchr:    inp   UART_DATA             ; read input byte and clear df
+            adi   0
+
+uartret:    ;;;                         ; can't put a label on #if line
+
+          #if UART_GROUP
+            sex   r3                    ; reset default group if changed
+            out   EXP_PORT
+            db    NO_GROUP
+            sex   r2
+          #endif
+
+            sep   sret                  ; return either sep or scall
+
+
+          ; Entry point to read a byte from the UART with a timeout in RB.
+
+tmouart:    phi   rb                    ; can't put a label on #if line
+
+          #if UART_GROUP
+            sex   r3
+            out   EXP_PORT
+            db    UART_GROUP
+            sex   r2
+          #endif
+
+            bz    uartzer
+
+uarttst:    inp   UART_STATUS
+            shr
+            bdf   uartchr
+
+            ldi   6
+uartdly:    smi   1
+            bnz   uartdly
+
+            dec   rb                    ; else test again if time is not up
+            ghi   rb
+            bnz   uarttst
+
+            br    uartret
+
+
+          ; ------------------------------------------------------------------
+          ; Send a byte through the UART using the F_UTYPE routine in BIOS.
+          ; Aside from the calling convention, this is very simple. Return
+          ; through GETUART so that the PC is setup for sending a byte.
+
+putuart:    stxd                        ; save the byte to send
+            stxd
+
+          #if UART_GROUP
+            sex   r3
+            out   EXP_PORT
+            db    UART_GROUP
+            sex   r2
+          #endif
+
+uartrdy:    inp   UART_STATUS
+            shl
+            bnf   uartrdy
+
+            irx
+            out   UART_DATA
+
+            br    uartret               ; return through getuart
+
+
+          ; ------------------------------------------------------------------
+          ; This is a complex update of the Nitro UART from MBIOS; it has been
+          ; modified to move the cycles for the bit rate factor decompression
+          ; into the time of the start bit to minimize time and allow back-to-
+          ; back bytes to be received without having to pre-decompress.
+          ;
+          ; This version also implements a timeout which is needed for XMODEM.
+          ; The timeout value is in RB.1 with a value of 255 being about five
+          ; seconds with a 4 MHz clock rate.
+          ;
+          ; The routine has also been folded into itself so that the return
+          ; point is just before the entry point to facilitate calling by SEP
+          ; by causing the entry point to be reset automaticaly each call.
+
+
+          ; If greater than 64, then 1.5 bit times is more than 8 bits so we
+          ; can't simply use the normal delay loop which has an 8-bit counter.
+          ; So we do the half bit first then fall into a normal one-bit delay.
+
+bitcomp:    ghi   re                    ; get half of bit time delay
+            shr
+
+bithalf:    smi   4                     ; delay in increments of 4 cycles
+            bdf   bithalf
+
+            adi   bitfrac+1             ; calculate jump from remainder
+            plo   r3
+
+            skp                         ; delay for between 2-5 cycles
+            skp
+            lskp
+bitfrac:    ldi   0
+
+          ; Delay for a full bit time using decompressed value from stack.
+
+bitloop:    ghi   re                   ; get delay time
+
+bittime:    smi   4                    ; delay in increments of 4 cycles
+            bdf   bittime
+
+            adi   bitjump+1            ; calculate jump from remainder
+            plo   r3
+
+            skp                        ; delay for between 2-5 cycles
+            skp
+            lskp
+bitjump:    ldi   0
+
+            BRSP  bitspac               ; if space then shift in a zero bit
+
+            glo   re                    ; data is mark so shift in a one bit
+            shrc
+            br    bitnext
+
+bitspac:    glo   re                    ; data is space so shift in a zero
+            shr
+            plo   re
+
+bitnext:    plo   re                    ; more bits to read if byte not zero
+            bdf   bitloop
+
+bitstop:    BRSP  bitstop               ; wait until the stop bit starts
+
+bitretn:    sep   sret                  ; return with pc pointing to start
+
+          ; This is the entry point of the bit-bang UART receive routine. The
+          ; first thing to do is watch for a start bit, but we need to have a
+          ; time limit of how long to wait. Since we need to maintain high
+          ; timing resolution, we check for the start bit change every-other
+          ; instruction interleaved into the timing loop.
+
+tmobits:    BRSP  bitinit               ; save timeout value
+            phi   rb
+
+            BRSP  bitinit               ; loop within the loop to add time
+bitidle:    ldi   4
+
+bitdlay:    BRSP  bitinit               ; decrement loop counter in d
+            smi   1
+
+            BRSP  bitinit               ; loop until delay finished
+            bnz   bitdlay
+
+            BRSP  bitinit               ; decrement main timer loop counter
+            dec   rb
+
+            BRSP  bitinit               ; check the high byte for zero
+            ghi   rb
+
+            BRSP  bitinit               ; if zero, then we have timed out
+            bz    bitretn
+
+            BRMK  bitidle               ; continue until something happens
+
+          ; The same shift register that is used to receive bits into is also
+          ; used to count loops by preloading it with all ones except the last
+          ; bit, which will shift out as zero when all the register is full.
+
+bitinit:    ldi   %01111111              ; set stop bit into byte buffer
+            plo   re
+
+            br    bitcomp                ; enter regular bit delay routine
+
+
+          ; ------------------------------------------------------------------
+          ; This is the transmit routine of the Nitro soft UART. This returns
+          ; following setting the level of the stop bit to maximize time for
+          ; processing, especially to receive a following character from the
+          ; other end. To avoid stop bit violations, we therefore need to 
+          ; delay on entry just a little less than a bit time.
+
+putbits:    plo   re                    ; save byte to send to shift register
+
+            ghi   re
+bitwait:    smi   4                     ; wait for minimum stop bit time
+            bdf   bitwait
+
+          ; Once the stop bit is timed, send the start bit and delay, and end
+          ; the delay with DF set as we then jump into the send loop and this
+          ; level will get shifted into the shift register just before we exit
+          ; and so determines the stop bit level.
+
+            SESP                        ; set start bit level
+
+            ghi   re                    ; get bit time, do again as a no-op
+            ghi   re
+
+bitstrt:    smi   4                     ; delay 4 cycles for each 4 counts
+            bdf   bitstrt
+
+            adi   bitsetf+1             ; jump into table for fine delay
+            plo   r3
+
+          ; For each bit we time the bulk delay with a loop and then jump into
+          ; a specially-constructed table to create the fine delay to a single
+          ; machine cycle. This is where we loop back for each bit to do this.
+          ; Exit from the delay with DF clear as this will get shifted into
+          ; the shift register, when it is all zeros that marks the end.
+
+bitmore:    ghi   re                    ; get bit time factor
+
+bitbits:    smi   4                     ; delay 4 cycles for each 4 counts
+            bdf   bitbits
+
+            sdi   bitclrf-1             ; jump into table for fine delay
+            plo   r3
+
+bitclrf:    skp                         ; delays from here are 5,4,3,2 cycles
+            skp
+            lskp
+bitsetf:    ldi   0
+
+            glo   re                    ; shift count bit in, data bit out
+            shrc
+            plo   re
+
+            bdf   bitmark               ; if bit is one then that's a mark
+
+            SESP                        ; else set space output, next bit
+            br    bitmore
+
+bitmark:    SEMK                        ; set mark output, do next bit
+            bnz   bitmore
+
+          ; When the shift register is all zeros, we have sent 8 data bits and
+          ; set the stop bit level. Return through the SEP in GETBITS so that
+          ; the PC is reset to receive a byte each time after sending one.
+
+            br    bitretn               ; return through getbits to set pc
+
+
+getbits:    BRSP  bitinit               ; save timeout value
+            br    getbits
+
+
+          ; The data buffer needs to be page aligned to simplify the pointer
+          ; math so go ahead and align both of these here. Neither is 
+          ; included in the executable though since they are 'ds'.
+
+            org   (($-1)|255)+1
+
+buffer:     ds    128                   ; xmodem data receive buffer
+
+end:        end   begin
 
